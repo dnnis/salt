@@ -10,20 +10,28 @@ Full list of Salt Cloud modules
     :toctree:
     :template: autosummary.rst.tmpl
 
+    aliyun
     botocore_aws
     cloudstack
     digital_ocean
+    digital_ocean_v2
     ec2
     gce
     gogrid
-    ibmsce
     joyent
     libcloud_aws
     linode
+    lxc
     msazure
     nova
+    opennebula
     openstack
     parallels
+    proxmox
+    pyrax
     rackspace
     saltify
     softlayer
+    softlayer_hw
+    vmware
+    vsphere

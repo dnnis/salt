@@ -17,10 +17,16 @@ configuration at:
       # SoftLayer account api key
       user: MYLOGIN
       apikey: JVkbSJDGHSDKUKSDJfhsdklfjgsjdkflhjlsdfffhgdgjkenrtuinv
-      provider: softlayer
+      driver: softlayer
 
+The SoftLayer Python Library needs to be installed in order to use the
+SoftLayer salt.cloud modules. See: https://pypi.python.org/pypi/SoftLayer
+
+:depends: softlayer
 '''
 # pylint: disable=E0102
+
+from __future__ import absolute_import
 
 # Import python libs
 import copy
@@ -29,10 +35,9 @@ import logging
 import time
 
 # Import salt cloud libs
+import salt.utils.cloud
 import salt.config as config
-from salt.cloud.exceptions import SaltCloudSystemExit
-from salt.cloud.libcloudfuncs import *   # pylint: disable=W0614,W0401
-from salt.utils import namespaced_function
+from salt.exceptions import SaltCloudSystemExit
 
 # Attempt to import softlayer lib
 try:
@@ -44,31 +49,18 @@ except ImportError:
 # Get logging started
 log = logging.getLogger(__name__)
 
-# Redirect SoftLayer functions to this module namespace
-script = namespaced_function(script, globals())
-
 
 # Only load in this module if the SoftLayer configurations are in place
 def __virtual__():
     '''
-    Set up the libcloud functions and check for SoftLayer configurations.
+    Check for SoftLayer configurations.
     '''
     if not HAS_SLLIBS:
-        log.debug(
-            'The SoftLayer Python Library needs to be installed in ordere to '
-            'use the SoftLayer salt.cloud module. See: '
-            'https://pypi.python.org/pypi/SoftLayer'
-        )
         return False
 
     if get_configured_provider() is False:
-        log.debug(
-            'There is no SoftLayer cloud provider configuration available. '
-            'Not loading module.'
-        )
         return False
 
-    log.debug('Loading SoftLayer cloud module')
     return True
 
 
@@ -81,6 +73,21 @@ def get_configured_provider():
         __active_provider_name__ or 'softlayer',
         ('apikey',)
     )
+
+
+def script(vm_):
+    '''
+    Return the script deployment object
+    '''
+    deploy_script = salt.utils.cloud.os_script(
+        config.get_cloud_config_value('script', vm_, __opts__),
+        vm_,
+        __opts__,
+        salt.utils.cloud.salt_config_to_yaml(
+            salt.utils.cloud.minion_config(__opts__, vm_)
+        )
+    )
+    return deploy_script
 
 
 def get_conn(service='SoftLayer_Virtual_Guest'):
@@ -113,7 +120,7 @@ def avail_locations(call=None):
     response = conn.getCreateObjectOptions()
     #return response
     for datacenter in response['datacenters']:
-        #return datacenter
+        #return data center
         ret[datacenter['template']['datacenter']['name']] = {
             'name': datacenter['template']['datacenter']['name'],
         }
@@ -192,7 +199,7 @@ def list_custom_images(call=None):
     conn = get_conn('SoftLayer_Account')
     response = conn.getBlockDeviceTemplateGroups()
     for image in response:
-        if not 'globalIdentifier' in image:
+        if 'globalIdentifier' not in image:
             continue
         ret[image['name']] = {
             'id': image['id'],
@@ -227,6 +234,12 @@ def create(vm_):
     '''
     Create a single VM from a data dict
     '''
+    # Check for required profile parameters before sending any API calls.
+    if config.is_profile_configured(__opts__,
+                                    __active_provider_name__ or 'softlayer',
+                                    vm_['profile']) is False:
+        return False
+
     salt.utils.cloud.fire_event(
         'event',
         'starting create',
@@ -236,6 +249,7 @@ def create(vm_):
             'profile': vm_['profile'],
             'provider': vm_['provider'],
         },
+        transport=__opts__['transport']
     )
 
     log.info('Creating Cloud VM {0}'.format(vm_['name']))
@@ -303,6 +317,7 @@ def create(vm_):
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
         {'kwargs': kwargs},
+        transport=__opts__['transport']
     )
 
     try:
@@ -310,12 +325,12 @@ def create(vm_):
     except Exception as exc:
         log.error(
             'Error creating {0} on SoftLayer\n\n'
-            'The following exception was thrown by libcloud when trying to '
+            'The following exception was thrown when trying to '
             'run the initial deployment: \n{1}'.format(
-                vm_['name'], exc.message
+                vm_['name'], str(exc)
             ),
             # Show the traceback if the debug logging level is enabled
-            exc_info=log.isEnabledFor(logging.DEBUG)
+            exc_info_on_loglevel=logging.DEBUG
         )
         return False
 
@@ -323,7 +338,10 @@ def create(vm_):
     private_ssh = config.get_cloud_config_value(
         'private_ssh', vm_, __opts__, default=False
     )
-    if private_ssh:
+    private_wds = config.get_cloud_config_value(
+        'private_windows', vm_, __opts__, default=False
+    )
+    if private_ssh or private_wds:
         ip_type = 'primaryBackendIpAddress'
 
     def wait_for_ip():
@@ -344,11 +362,22 @@ def create(vm_):
     if config.get_cloud_config_value('deploy', vm_, __opts__) is not True:
         return show_instance(vm_['name'], call='action')
 
+    SSH_PORT = 22
+    WINDOWS_DS_PORT = 445
+    managing_port = SSH_PORT
+    if config.get_cloud_config_value('windows', vm_, __opts__) or \
+            config.get_cloud_config_value('win_installer', vm_, __opts__):
+        managing_port = WINDOWS_DS_PORT
+
     ssh_connect_timeout = config.get_cloud_config_value(
-        'ssh_connect_timeout', vm_, __opts__, 900   # 15 minutes
+        'ssh_connect_timeout', vm_, __opts__, 15 * 60
+    )
+    connect_timeout = config.get_cloud_config_value(
+        'connect_timeout', vm_, __opts__, ssh_connect_timeout
     )
     if not salt.utils.cloud.wait_for_port(ip_address,
-                                         timeout=ssh_connect_timeout):
+                                          port=managing_port,
+                                          timeout=connect_timeout):
         raise SaltCloudSystemExit(
             'Failed to authenticate against remote ssh'
         )
@@ -363,7 +392,7 @@ def create(vm_):
         },
     }
 
-    def get_passwd():
+    def get_credentials():
         '''
         Wait for the password to become available
         '''
@@ -371,30 +400,32 @@ def create(vm_):
         for node in node_info:
             if node['id'] == response['id']:
                 if 'passwords' in node['operatingSystem'] and len(node['operatingSystem']['passwords']) > 0:
-                    return node['operatingSystem']['passwords'][0]['password']
+                    return node['operatingSystem']['passwords'][0]['username'], node['operatingSystem']['passwords'][0]['password']
         time.sleep(5)
         return False
 
-    passwd = salt.utils.cloud.wait_for_fun(
-        get_passwd,
+    username, passwd = salt.utils.cloud.wait_for_fun(  # pylint: disable=W0633
+        get_credentials,
         timeout=config.get_cloud_config_value(
             'wait_for_fun_timeout', vm_, __opts__, default=15 * 60),
     )
+    response['username'] = username
     response['password'] = passwd
     response['public_ip'] = ip_address
 
     ssh_username = config.get_cloud_config_value(
-        'ssh_username', vm_, __opts__, default='root'
+        'ssh_username', vm_, __opts__, default=username
     )
 
     ret = {}
     if config.get_cloud_config_value('deploy', vm_, __opts__) is True:
         deploy_script = script(vm_)
         deploy_kwargs = {
+            'opts': __opts__,
             'host': ip_address,
             'username': ssh_username,
             'password': passwd,
-            'script': deploy_script.script,
+            'script': deploy_script,
             'name': vm_['name'],
             'tmp_dir': config.get_cloud_config_value(
                 'tmp_dir', vm_, __opts__, default='/tmp/.saltcloud'
@@ -452,10 +483,10 @@ def create(vm_):
             minion = salt.utils.cloud.minion_config(__opts__, vm_)
             deploy_kwargs['master'] = minion['master']
             deploy_kwargs['username'] = config.get_cloud_config_value(
-                'win_username', vm_, __opts__, default='Administrator'
+                'win_username', vm_, __opts__, default=username
             )
             deploy_kwargs['password'] = config.get_cloud_config_value(
-                'win_password', vm_, __opts__, default=''
+                'win_password', vm_, __opts__, default=passwd
             )
 
         # Store what was used to the deploy the VM
@@ -472,6 +503,7 @@ def create(vm_):
             'executing deploy script',
             'salt/cloud/{0}/deploying'.format(vm_['name']),
             {'kwargs': event_kwargs},
+            transport=__opts__['transport']
         )
 
         deployed = False
@@ -507,6 +539,7 @@ def create(vm_):
             'profile': vm_['profile'],
             'provider': vm_['provider'],
         },
+        transport=__opts__['transport']
     )
 
     return ret
@@ -526,6 +559,7 @@ def list_nodes_full(mask='mask[id]', call=None):
     response = conn.getVirtualGuests()
     for node_id in response:
         ret[node_id['hostname']] = node_id
+    salt.utils.cloud.cache_node_list(ret, __active_provider_name__.split(':')[0], __opts__)
     return ret
 
 
@@ -556,6 +590,8 @@ def list_nodes(call=None):
             ret[node]['public_ips'] = nodes[node]['primaryIpAddress']
         if 'primaryBackendIpAddress' in nodes[node]:
             ret[node]['private_ips'] = nodes[node]['primaryBackendIpAddress']
+        if 'status' in nodes[node]:
+            ret[node]['state'] = str(nodes[node]['status']['name'])
     return ret
 
 
@@ -578,6 +614,7 @@ def show_instance(name, call=None):
         )
 
     nodes = list_nodes_full()
+    salt.utils.cloud.cache_node(nodes[name], __active_provider_name__, __opts__)
     return nodes[name]
 
 
@@ -585,7 +622,9 @@ def destroy(name, call=None):
     '''
     Destroy a node.
 
-    CLI Example::
+    CLI Example:
+
+    .. code-block:: bash
 
         salt-cloud --destroy mymachine
     '''
@@ -600,6 +639,7 @@ def destroy(name, call=None):
         'destroying instance',
         'salt/cloud/{0}/destroying'.format(name),
         {'name': name},
+        transport=__opts__['transport']
     )
 
     node = show_instance(name, call='action')
@@ -611,7 +651,10 @@ def destroy(name, call=None):
         'destroyed instance',
         'salt/cloud/{0}/destroyed'.format(name),
         {'name': name},
+        transport=__opts__['transport']
     )
+    if __opts__.get('update_cachedir', False) is True:
+        salt.utils.cloud.delete_minion_cachedir(name, __active_provider_name__.split(':')[0], __opts__)
 
     return response
 

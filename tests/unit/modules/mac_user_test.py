@@ -3,19 +3,24 @@
     :codeauthor: :email:`Nicole Thomas <nicole@saltstack.com>`
 '''
 
+# Import python libs
+from __future__ import absolute_import
+import grp
+import pwd
+
 # Import Salt Testing Libs
 from salttesting import TestCase, skipIf
-from salttesting.mock import MagicMock, patch
+from salttesting.helpers import ensure_in_syspath
+from salttesting.mock import MagicMock, patch, NO_MOCK, NO_MOCK_REASON
+
+ensure_in_syspath('../../')
 
 # Import Salt Libs
 from salt.modules import mac_user
 from salt.exceptions import SaltInvocationError, CommandExecutionError
 
-# Import python Libs
-import pwd
-import grp
 
-
+@skipIf(NO_MOCK, NO_MOCK_REASON)
 class MacUserTestCase(TestCase):
     '''
     TestCase for the salt.modules.mac_user modules
@@ -42,14 +47,6 @@ class MacUserTestCase(TestCase):
                      'groups': ['TEST_GROUP'], 'home': '/Users/foo',
                      'fullname': 'TEST USER', 'uid': 4376}
 
-    def test_osmajor(self):
-        '''
-        Tests version of OS X
-        '''
-        with patch.dict(mac_user.__grains__, {'kernel': 'Darwin',
-                                              'osrelease': '10.9.1'}):
-            self.assertEqual(mac_user._osmajor(), 10.9)
-
     @skipIf(True, 'Waiting on some clarifications from bug report #10594')
     def test_flush_dscl_cache(self):
         # TODO: Implement tests after clarifications come in
@@ -64,8 +61,9 @@ class MacUserTestCase(TestCase):
                                            'stderr': '',
                                            'stdout': ''})
         with patch.dict(mac_user.__salt__, {'cmd.run_all': mac_mock}):
-            with patch.dict(mac_user.__grains__, {'kernel': 'Darwin',
-                                                  'osrelease': '10.9.1'}):
+            with patch.dict(mac_user.__grains__,
+                            {'kernel': 'Darwin', 'osrelease': '10.9.1',
+                             'osrelease_info': (10, 9, 1)}):
                 self.assertEqual(mac_user._dscl('username'), {'pid': 4948,
                                                               'retcode': 0,
                                                               'stderr': '',
@@ -272,7 +270,7 @@ class MacUserTestCase(TestCase):
 
     @patch('salt.modules.mac_user.info', MagicMock(return_value=mock_info_ret))
     @patch('salt.modules.mac_user.list_groups',
-           MagicMock(return_value={'wheel', 'root'}))
+           MagicMock(return_value=('wheel', 'root')))
     def test_chgroups_same_desired(self):
         '''
         Tests if the user's list of groups is the same as the arguments
@@ -308,15 +306,6 @@ class MacUserTestCase(TestCase):
                      'fullname': 'AMaViS Daemon', 'uid': 83}
         self.assertEqual(mac_user._format_info(data), ret)
 
-    @patch('pwd.getpwnam', MagicMock(return_value=mock_pwnam))
-    @patch('grp.getgrgid', MagicMock(return_value=mock_getgrgid))
-    @patch('grp.getgrall', MagicMock(return_value=mock_getgrall))
-    def test_list_groups(self):
-        '''
-        Tests the list of groups the user belongs to
-        '''
-        self.assertEqual(mac_user.list_groups('name'), ['_TEST_GROUP'])
-
     @patch('pwd.getpwall', MagicMock(return_value=mock_pwall))
     def test_list_users(self):
         '''
@@ -324,3 +313,8 @@ class MacUserTestCase(TestCase):
         '''
         ret = ['_amavisd', '_appleevents', '_appowner']
         self.assertEqual(mac_user.list_users(), ret)
+
+
+if __name__ == '__main__':
+    from integration import run_tests
+    run_tests(MacUserTestCase, needs_daemon=False)
